@@ -1,16 +1,15 @@
 {
   "name": "fitai-proxy",
   "version": "1.0.0",
-  "description": "Serverless proxy for FitAI: parse-image, generate-meals, chat, barcode-lookup (Vercel-ready).",
+  "description": "Serverless API for NutriScan app",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "vercel dev",
-    "test": "node -e \"console.log('No tests; run functions with vercel dev')\""
+    "build": "echo 'No build step required'",
+    "start": "vercel dev"
   },
-  "dependencies": {
-    "node-fetch": "^3.4.1"
-  },
+  "dependencies": {},
   "engines": {
-    "node": "18.x"
+    "node": "20.x"
   }
 }
