@@ -1,4 +1,3 @@
-import fetch from "node-fetch";
 import { MOCK_RECIPES } from "../lib/mockData.js";
 import { requireProxyKey } from "../lib/utils.js";
 
