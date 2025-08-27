@@ -1,3 +1,4 @@
+// api/generate-meals.js
 import { MOCK_RECIPES } from "../lib/mockData.js";
 import { requireProxyKey } from "../lib/utils.js";
 
@@ -6,31 +7,43 @@ const SPOONACULAR_KEY = process.env.SPOONACULAR_KEY;
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
   if (!requireProxyKey(req, res)) return;
+
   const MOCK = (process.env.MOCK || "true") === "true";
-  const { ingredients = [], diet = "none", calorieTarget = null, servings = 1, userProfile = {} } = req.body || {};
+
+  const { ingredients = [], diet = "none", calorieTarget = null, servings = 1, userProfile = {} } =
+    req.body || {};
+
   if (!Array.isArray(ingredients) || ingredients.length === 0) {
     return res.status(400).json({ error: "Please provide an ingredients array in the request body." });
   }
+
   if (MOCK) {
+    // quick mocked response
     return res.json({
       recipes: MOCK_RECIPES,
       notes: "mock mode",
       input: { ingredients, diet, calorieTarget, servings }
     });
   }
+
+  // ---------- REAL MODE ----------
   if (!OPENAI_KEY) {
     return res.status(500).json({ error: "OPENAI_API_KEY not set in environment. Cannot generate recipes." });
   }
+
   const systemPrompt = `You are an expert chef and registered dietitian. You will be given a list of pantry ingredients and user constraints.
 Return EXACTLY JSON: an array named "recipes" with up to 3 recipe objects.
 Each recipe object must have: title, description, ingredients (array of {name,quantity}), steps (array of strings), estimatedCalories (per serving), macros {protein,carbs,fat} (grams).
 Do not output any extra commentary or markdown.`;
+
   const userPrompt = `Ingredients: ${ingredients.join(", ")}.
 Diet: ${diet}.
 Calorie target (optional): ${calorieTarget || "none"}.
 Servings: ${servings}.
 User profile: ${JSON.stringify(userProfile)}`;
+
   try {
     const openaiResp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -57,6 +70,7 @@ User profile: ${JSON.stringify(userProfile)}`;
     if (!parsed || !parsed.recipes) {
       return res.status(500).json({ error: "OpenAI returned unexpected format", raw: text, debug: openaiData });
     }
+
     if (SPOONACULAR_KEY) {
       const recipesWithNutrition = [];
       for (let r of parsed.recipes) {
@@ -79,6 +93,7 @@ User profile: ${JSON.stringify(userProfile)}`;
       }
       return res.json({ recipes: recipesWithNutrition });
     }
+
     return res.json({ recipes: parsed.recipes });
   } catch (err) {
     console.error("generate-meals error:", err);
