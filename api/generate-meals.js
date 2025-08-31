@@ -10,6 +10,21 @@ export default async function handler(req, res) {
 
   if (!requireProxyKey(req, res)) return;
 
+    // --- DEBUG BLOCK (temporary) ---
+  // If you call the endpoint with ?debug=true or send { "debug": true } in the body,
+  // we return a small safe object showing whether env vars exist (no secrets printed).
+  if (req.query?.debug === "true" || (req.body && req.body.debug === true)) {
+    return res.json({
+      debug: {
+        MOCK_env_value: process.env.MOCK ?? null,
+        OPENAI_key_present: !!process.env.OPENAI_API_KEY,
+        SPOONACULAR_key_present: !!process.env.SPOONACULAR_KEY
+      }
+    });
+  }
+  // --- END DEBUG BLOCK ---
+
+
   const MOCK = (process.env.MOCK || "true") === "true";
 
   const { ingredients = [], diet = "none", calorieTarget = null, servings = 1, userProfile = {} } =
