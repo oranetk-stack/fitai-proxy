@@ -8,10 +8,16 @@ const SPOONACULAR_KEY = process.env.SPOONACULAR_KEY;
 // Helper: safe JSON parse attempt
 function safeParseJson(text) {
   if (!text) return null;
-  try { return JSON.parse(text); } catch (e) {
+  try {
+    return JSON.parse(text);
+  } catch (e) {
     const jsonMatch = text && text.match(/\{[\s\S]*\}$/);
     if (jsonMatch) {
-      try { return JSON.parse(jsonMatch[0]); } catch (e2) { return null; }
+      try {
+        return JSON.parse(jsonMatch[0]);
+      } catch (e2) {
+        return null;
+      }
     }
     return null;
   }
@@ -25,7 +31,9 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
   if (!requireProxyKey(req, res)) return;
 
-  const { ingredients = [], diet = "none", calorieTarget = null, servings = 1, userProfile = {} } = req.body || {};
+  const { ingredients = [], diet = "none", calorieTarget = null, servings = 1, userProfile = {} } =
+    req.body || {};
+
   if (!Array.isArray(ingredients) || ingredients.length === 0) {
     return res.status(400).json({ error: "Please provide an ingredients array in the request body." });
   }
@@ -63,7 +71,7 @@ Servings: ${servings}
 UserProfile: ${JSON.stringify(userProfile)}`;
 
   try {
-    // Call OpenAI
+    // Call OpenAI Chat Completions
     const openaiResp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
@@ -92,18 +100,40 @@ UserProfile: ${JSON.stringify(userProfile)}`;
       const recipesWithNutrition = [];
       for (const r of parsed.recipes) {
         try {
-          const ingrList = (r.ingredients || []).map(i => `${i.quantity || ""} ${i.name || ""}`).join("\n");
-          const spoonRes = await fetch(`https://api.spoonacular.com/recipes/parseIngredients?apiKey=${SPOONACULAR_KEY}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ingredientList: ingrList })
-          });
-          const spoonJson = await spoonRes.json();
+          // Prepare ingredient lines (quantity + name) for Spoonacular parsing
+          const ingrList = (r.ingredients || [])
+            .map(i => `${i.quantity || ""} ${i.name || ""}`.trim())
+            .filter(Boolean)
+            .join("\n");
+
+          // Use application/x-www-form-urlencoded so Spoonacular receives 'ingredientList' as a form param
+          const form = new URLSearchParams();
+          form.append("ingredientList", ingrList);
+
+          const spoonRes = await fetch(
+            `https://api.spoonacular.com/recipes/parseIngredients?apiKey=${SPOONACULAR_KEY}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: form.toString()
+            }
+          );
+
+          let spoonJson = null;
+          if (spoonRes.ok) {
+            spoonJson = await spoonRes.json();
+          } else {
+            const textErr = await spoonRes.text();
+            console.warn("Spoonacular parseIngredients failed:", spoonRes.status, textErr);
+            spoonJson = { status: "failure", code: spoonRes.status, message: textErr };
+          }
+
           r.spoonacular = spoonJson || null;
           r.source = r.source || "openai+spoonacular";
         } catch (err) {
           console.warn("Spoonacular parse failed:", err);
           r.source = r.source || "openai";
+          r.spoonacular = { status: "failure", message: String(err) };
         }
         recipesWithNutrition.push(r);
       }
