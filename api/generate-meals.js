@@ -4,11 +4,35 @@ import { requireProxyKey } from "../lib/utils.js";
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const SPOONACULAR_KEY = process.env.SPOONACULAR_KEY;
+const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 86400); // 24h default
 
-// Helper: safe JSON parse attempt
+// ---------------------- Simple in-memory cache ----------------------
+// Note: In serverless environments this cache is ephemeral (per instance).
+// It still helps during warm instances and spikes. For persistent cross-instance
+// caching, use Vercel KV / Upstash Redis (see notes below).
+const ingredientInfoCache = new Map(); // key -> { value, expiresAt (ms) }
+
+function cacheGet(key) {
+  const e = ingredientInfoCache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) {
+    ingredientInfoCache.delete(key);
+    return null;
+  }
+  return e.value;
+}
+
+function cacheSet(key, value, ttlSeconds = CACHE_TTL_SECONDS) {
+  const expiresAt = Date.now() + ttlSeconds * 1000;
+  ingredientInfoCache.set(key, { value, expiresAt });
+}
+
+// ---------------------- Helpers ----------------------
 function safeParseJson(text) {
   if (!text) return null;
-  try { return JSON.parse(text); } catch (e) {
+  try {
+    return JSON.parse(text);
+  } catch (e) {
     const jsonMatch = text && text.match(/\{[\s\S]*\}$/);
     if (jsonMatch) {
       try { return JSON.parse(jsonMatch[0]); } catch (e2) { return null; }
@@ -17,7 +41,6 @@ function safeParseJson(text) {
   }
 }
 
-// Normalize nutrient name to key we care about
 function nutrientKey(name) {
   const n = (name || "").toLowerCase();
   if (n.includes("calorie")) return "calories";
@@ -27,9 +50,46 @@ function nutrientKey(name) {
   return null;
 }
 
-// MOCK feature flag: set MOCK="true" in Vercel to enable canned responses.
-// Default: real mode (when MOCK is not "true").
 const MOCK = process.env.MOCK === "true";
+
+// Optional: placeholder to plug in persistent cache (Upstash / Redis / Vercel KV)
+// If you add a persistent cache, implement getIngredientInfoFromPersistentCache() and use it.
+// Example env var: PERSISTENT_CACHE_PROVIDER=upstash and UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN.
+async function getIngredientInfoFromSpoonacularCached(id, amount, unit) {
+  // create a stable cache key
+  const key = `${id}|${amount}|${unit}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  // Fetch from Spoonacular
+  try {
+    const infoUrl = new URL(`https://api.spoonacular.com/food/ingredients/${id}/information`);
+    infoUrl.searchParams.set("apiKey", SPOONACULAR_KEY);
+    infoUrl.searchParams.set("amount", String(amount));
+    infoUrl.searchParams.set("unit", String(unit));
+
+    const infoRes = await fetch(infoUrl.toString(), { method: "GET" });
+    if (!infoRes.ok) {
+      const txt = await infoRes.text();
+      console.warn("Ingredient information fetch failed:", infoRes.status, txt);
+      // cache the failure response for a short time to avoid tight retry loops
+      const failureObj = { error: true, status: infoRes.status, text: txt };
+      cacheSet(key, failureObj, 60); // short TTL for failures
+      return failureObj;
+    }
+
+    const infoJson = await infoRes.json();
+    cacheSet(key, infoJson, CACHE_TTL_SECONDS);
+    return infoJson;
+  } catch (err) {
+    console.warn("Ingredient info fetch error:", err);
+    const failureObj = { error: true, message: String(err) };
+    cacheSet(key, failureObj, 60);
+    return failureObj;
+  }
+}
+
+// -------------------------------------------------------------------
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -40,7 +100,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Please provide an ingredients array in the request body." });
   }
 
-  // MOCK short-circuit
   if (MOCK) {
     return res.json({
       recipes: MOCK_RECIPES,
@@ -49,7 +108,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // Ensure OpenAI key exists
   if (!OPENAI_KEY) {
     console.error("OPENAI_API_KEY missing in environment");
     return res.status(500).json({ error: "Server misconfigured: missing OPENAI_API_KEY" });
@@ -74,7 +132,7 @@ Servings: ${servings}
 UserProfile: ${JSON.stringify(userProfile)}`;
 
   try {
-    // 1) Ask OpenAI for structured recipes
+    // 1) Ask OpenAI for recipes
     const openaiResp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
@@ -88,6 +146,7 @@ UserProfile: ${JSON.stringify(userProfile)}`;
         max_tokens: 1200
       })
     });
+
     const openaiData = await openaiResp.json();
     const text = openaiData?.choices?.[0]?.message?.content;
     const parsed = safeParseJson(text);
@@ -97,104 +156,80 @@ UserProfile: ${JSON.stringify(userProfile)}`;
       return res.status(502).json({ error: "AI returned unexpected format", details: openaiData?.error || "parsing failed" });
     }
 
-    // 2) If Spoonacular available, attempt to parse ingredients (we may have done this earlier),
-    //    then compute nutrition per ingredient by calling the ingredient information endpoint.
+    // 2) If Spoonacular configured -> parse & compute nutrition with caching
     if (SPOONACULAR_KEY) {
       const recipesWithNutrition = [];
 
       for (const r of parsed.recipes) {
-        // default values
         let nutritionTotals = { calories: 0, protein: 0, carbs: 0, fat: 0 };
         let nutritionSource = null;
 
         try {
-          // Build a simple ingredient list for parseIngredients call (quantity + name lines)
           const ingrList = (r.ingredients || [])
             .map(i => `${i.quantity || ""} ${i.name || ""}`.trim())
             .filter(Boolean)
             .join("\n");
 
-          // 2a) Parse ingredients (we may already have parsed earlier)
+          // parseIngredients: form-encoded (we did this earlier)
           const form = new URLSearchParams();
           form.append("ingredientList", ingrList);
 
           const spoonParseRes = await fetch(
             `https://api.spoonacular.com/recipes/parseIngredients?apiKey=${SPOONACULAR_KEY}`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: form.toString()
-            }
+            { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form.toString() }
           );
 
           let spoonParsed = null;
           if (spoonParseRes.ok) {
-            spoonParsed = await spoonParseRes.json(); // array of parsed ingredient objects with id/amount/unit
+            spoonParsed = await spoonParseRes.json();
           } else {
             const txt = await spoonParseRes.text();
             console.warn("Spoonacular parseIngredients failed:", spoonParseRes.status, txt);
             spoonParsed = null;
           }
 
-          // 2b) For each parsed ingredient, call ingredient information to get nutrition for that amount
           if (Array.isArray(spoonParsed) && spoonParsed.length > 0) {
-            // Accumulate nutrition across ingredients
+            // For each parsed ingredient, fetch ingredient info (cached)
             for (const p of spoonParsed) {
               try {
-                // p should have id, amount, unit. If not present, skip.
                 const id = p.id;
                 const amount = p.amount;
                 let unit = p.unit || p.unitShort || p.unitString || "";
 
                 if (!id || !amount || !unit) {
-                  // fallback: skip this ingredient for spoonacular nutrition
-                  continue;
+                  continue; // skip if not enough info
                 }
 
-                // Build ingredient info URL: /food/ingredients/{id}/information?amount={amount}&unit={unit}
-                const infoUrl = new URL(`https://api.spoonacular.com/food/ingredients/${id}/information`);
-                infoUrl.searchParams.set("apiKey", SPOONACULAR_KEY);
-                infoUrl.searchParams.set("amount", String(amount));
-                infoUrl.searchParams.set("unit", String(unit));
+                // Attempt to get cached ingredient info
+                const info = await getIngredientInfoFromSpoonacularCached(id, amount, unit);
 
-                const infoRes = await fetch(infoUrl.toString(), { method: "GET" });
-                if (!infoRes.ok) {
-                  const txt = await infoRes.text();
-                  console.warn("Ingredient information fetch failed:", infoRes.status, txt);
-                  continue;
+                if (info && !info.error) {
+                  const nutrients = info?.nutrition?.nutrients || [];
+                  for (const nutrient of nutrients) {
+                    const key = nutrientKey(nutrient?.name || nutrient?.title || "");
+                    if (!key) continue;
+                    const value = Number(nutrient.amount) || 0;
+                    nutritionTotals[key] = (nutritionTotals[key] || 0) + value;
+                  }
                 }
-                const infoJson = await infoRes.json();
-                const nutrients = infoJson?.nutrition?.nutrients || [];
-
-                // Extract targeted nutrients (names vary; match by lowercase contains)
-                for (const nutrient of nutrients) {
-                  const key = nutrientKey(nutrient?.name || nutrient?.title || "");
-                  if (!key) continue;
-                  // nutrient.amount is typically in grams for macros and kcal for calories
-                  const value = Number(nutrient.amount) || 0;
-                  nutritionTotals[key] = (nutritionTotals[key] || 0) + value;
-                }
+                // attach spoonParsed raw info to recipe for inspection
+                r.spoonacular = spoonParsed;
               } catch (perIngErr) {
                 console.warn("Error computing ingredient nutrition:", perIngErr);
-                // continue to next ingredient
               }
-            } // end each parsed ingredient
+            } // end for each parsed ingredient
 
-            // If we have any totals > 0, consider spoonacular successful
             const anyTotal = (nutritionTotals.calories || 0) + (nutritionTotals.protein || 0) + (nutritionTotals.carbs || 0) + (nutritionTotals.fat || 0);
             if (anyTotal > 0) {
               nutritionSource = "spoonacular";
-              // attach spoonParsed raw info for debugging/inspection
-              r.spoonacular = spoonParsed;
             }
-          } // end spoonParsed usable
+          }
         } catch (err) {
-          console.warn("Spoonacular nutrition compute failed for recipe:", err);
+          console.warn("Spoonacular nutrition compute failed:", err);
         }
 
-        // 3) If spoonacular failed to compute nutrition, fall back to OpenAI's estimates in the recipe
+        // fallback: OpenAI estimates if Spoonacular didn't produce totals
         if (!nutritionSource) {
-          // Use the OpenAI-supplied estimatedCalories and macros if present
           const estCalories = Number(r.estimatedCalories || r.calories || 0);
           const estProtein = (r.macros && Number(r.macros.protein)) || 0;
           const estCarbs = (r.macros && Number(r.macros.carbs)) || 0;
@@ -209,7 +244,6 @@ UserProfile: ${JSON.stringify(userProfile)}`;
           nutritionSource = "openai_estimate";
         }
 
-        // 4) Normalize and attach totals and per-serving
         const perServing = {
           calories: Math.round((nutritionTotals.calories || 0) / Math.max(1, servings)),
           protein: Math.round((nutritionTotals.protein || 0) / Math.max(1, servings)),
@@ -228,19 +262,16 @@ UserProfile: ${JSON.stringify(userProfile)}`;
           source: nutritionSource
         };
 
-        // ensure source flag exists
         r.source = r.source || (nutritionSource === "spoonacular" ? "openai+spoonacular" : "openai");
-
         recipesWithNutrition.push(r);
       } // end for each recipe
 
       return res.json({ recipes: recipesWithNutrition });
-    } // end SPOONACULAR_KEY branch
+    } // end if SPOONACULAR_KEY
 
-    // No Spoonacular configured: return OpenAI recipes and mark source
+    // No Spoonacular: return OpenAI recipes (estimates)
     parsed.recipes.forEach(r => {
       r.source = r.source || "openai";
-      // ensure nutrition field exists as best-effort
       r.nutrition = r.nutrition || {
         totals: {
           calories: Math.round(r.estimatedCalories || 0),
