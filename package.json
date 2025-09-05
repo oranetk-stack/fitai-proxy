@@ -8,7 +8,7 @@
     "test": "node -e \"console.log('No tests; run functions with vercel dev')\""
   },
   "dependencies": {
-    "@sentry/node": "^10.9.0",
+    "@sentry/node": "^10.10.0",
     "@upstash/redis": "^1.35.3",
     "p-limit": "^7.1.1"
   },
